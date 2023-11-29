@@ -2,7 +2,14 @@
 name = "history_stack"
 version = "0.1.0"
 edition = "2021"
+keywords = ["stack", "history", "generic", "wrapper"]
+categories = ["data-structures", "no-std"]
+homepage = "https://github.com/ultrabear/history_stack"
+repository = "https://github.com/ultrabear/history_stack"
+authors = ["Alexander Hall <bearodark@gmail.com>"]
+description = "A collection of containers that support generic history tracking mechanisms"
+readme = "README.md"
+license = "MPL-2.0"
+# Subject to change
+rust-version = "1.65"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[dependencies]
