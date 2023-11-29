@@ -1,15 +1,15 @@
-//! A crate implementing a `HistoryStack` that lets you push to store a state and pop to retrieve it
-//! later
+//! A crate implementing generic history managers that can act as building blocks for transactional
+//! state and reversible computations
 
 #![no_std]
 #![forbid(unsafe_code)]
 #![warn(clippy::alloc_instead_of_core, clippy::std_instead_of_alloc)]
 #![warn(clippy::pedantic, clippy::cargo)]
 #![allow(clippy::module_name_repetitions)]
-//#![warn(missing_docs, clippy::missing_docs_in_private_items)]
+#![warn(missing_docs, clippy::missing_docs_in_private_items)]
 extern crate alloc;
 
-use core::{cmp, hash, ops};
+use core::{cmp, fmt, hash, ops};
 
 use alloc::vec::Vec;
 
@@ -17,10 +17,9 @@ use alloc::vec::Vec;
 /// can be pushed to or popped from to save the current value or pop out a previously saved value
 /// in LIFO (stack) order.
 ///
-/// This is useful when you want to be able to make changes in a way where you can undo a change,
-/// and then reapply it later, but do not wish to write a complex incremental structure that could
-/// track changes like that. This type provides a generic (read: you can use it on anything)
-/// interface to achieve that effect, even if it may use more memory than a more targeted approach.
+/// `HistoryStack` is also "transparently T", meaning the default traits it implements all act like
+/// the current value of T, so hashing `HistoryStack<T>` and T produce the same hash, Eq and Ord work
+/// the same etc. This also includes `Display`, but does not include `Debug`.
 #[derive(Clone, Default, Debug)]
 pub struct HistoryStack<T> {
     /// The history stack, this starts out empty and should only be modified via pushing and popping
@@ -28,6 +27,12 @@ pub struct HistoryStack<T> {
     /// The current value, since `HistoryStack<T>` acts like a T, this is always initialized to
     /// some value
     current: T,
+}
+
+impl<T: fmt::Display> fmt::Display for HistoryStack<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.current.fmt(f)
+    }
 }
 
 impl<T> HistoryStack<T> {
@@ -64,16 +69,6 @@ impl<T> HistoryStack<T> {
         T: Clone,
     {
         self.stack.push(self.current.clone());
-    }
-
-    /// Gets an immutable reference to the current value, an explicit version of `Deref`
-    pub fn get(&self) -> &T {
-        self
-    }
-
-    /// Gets a mutable reference to the current value, an explicit version of `DerefMut`
-    pub fn get_mut(&mut self) -> &mut T {
-        self
     }
 }
 
@@ -129,14 +124,67 @@ impl<T: hash::Hash> hash::Hash for HistoryStack<T> {
     }
 }
 
-/// A structure which allows you to undo and redo changes based on saved states of `T`
+/// A structure which allows you to undo and redo changes based on saved states of `T`.
+///
+/// To use, simply [`save`](UndoStack::save), [`undo`](UndoStack::undo), and
+/// [`redo`](UndoStack::redo) later if needed;
+/// ```rust
+/// # use history_stack::UndoStack;
+/// // Create with initial state
+/// let mut undo = UndoStack::new(5u8);
+///
+/// // make a savepoint and get a reference to the new current value
+/// // our stack looks like [5, 5] currently, our current value being the second
+/// let newref = undo.save();
+///
+/// // we modified the new current value, our stack looks like [5, 10] now
+/// *newref *= 2;
+///
+/// // but we made a mistake! we want to go back now, and since we are
+/// // sure we saved earlier we can unwrap here to get the Ok variant
+/// // our stack still looks like [5, 10], but now we point to the 5
+/// let oldref = undo.undo().unwrap();
+///
+/// // turns out it wasnt a mistake, lets redo and unwrap to be sure we got the newer value
+/// undo.redo().unwrap();
+///
+/// // UndoStack implements Deref and DerefMut, we can make sure we got the new value like this
+/// assert_eq!(undo, 10);
+/// ```
+///
+/// This is useful when you want to be able to make changes in a way where you can undo a change,
+/// and then reapply it later, but do not wish to write a complex incremental structure that could
+/// track changes like that. This type provides a generic (read: you can use it on anything)
+/// interface to achieve that effect, even if it may use more memory than a more targeted approach.
+///
+/// `UndoStack` is also "transparently T", meaning the default traits it implements all act like
+/// the current value of T, so hashing `UndoStack<T>` and T produce the same hash, Eq and Ord work
+/// the same etc. This also includes `Display`, but does not include `Debug`.
 #[derive(Clone, Debug)]
 pub struct UndoStack<T> {
+    /// History of the undostack that includes the current value somewhere within
     history: Vec<T>,
+    /// Index into history that represents the current value
     current: usize,
 }
 
+impl<T: Default> Default for UndoStack<T> {
+    fn default() -> Self {
+        Self {
+            history: alloc::vec![T::default()],
+            current: 0,
+        }
+    }
+}
+
+impl<T: fmt::Display> fmt::Display for UndoStack<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.inner().fmt(f)
+    }
+}
+
 impl<T> UndoStack<T> {
+    /// Creates a new `UndoStack` with a starting value to act as the current value
     pub fn new(start: T) -> Self {
         Self {
             history: alloc::vec![start],
@@ -144,14 +192,8 @@ impl<T> UndoStack<T> {
         }
     }
 
-    /// Saves the current T to history and invalidates any data that may be used to redo
-    /// This will [`Drop`] any T that exist later in history than the current edit point.
-    ///
-    /// Returns a reference to the new current value
-    pub fn save(&mut self) -> &mut T
-    where
-        T: Clone,
-    {
+    /// Drops any values that exist after the current value
+    fn invalidate_future(&mut self) {
         // we have hit undo if these values do not match up, so we must invalidate the redo stack
         // it is safe to do current+1 because current is <history.len() which is stored
         // as usize aswell
@@ -159,24 +201,62 @@ impl<T> UndoStack<T> {
             // see above for +1 safety
             self.history.truncate(self.current + 1);
         }
+    }
 
-        // safe to unwrap here because history is always nonempty, however after this point it may
-        // be empty so we cannot assume this until we push again
-        let val = self.history.pop().unwrap();
-
-        // history is nonempty again
-        self.history.push(val.clone());
+    /// Pushes a value assuming the current value is the last value
+    /// returns a reference to the new current value (the value that was just pushed)
+    fn push_unchecked(&mut self, val: T) -> &mut T {
         self.history.push(val);
 
-        // we popped once and pushed twice, see above for +1 safety
+        // +1 safety: current is always less than history.len(), which would panic on overflow
         self.current += 1;
 
         &mut self.history[self.current]
     }
 
-    /// If there is a previous state in the history stack, backtrack to that and return Ok(&mut T)
-    /// to the new current value, otherwise return Err(&mut T) to the unchanged current value
+    /// Saves the current T to history and invalidates any data that may be used to redo
+    /// This will [`Drop`] any T that exist later in history than the current edit point.
+    ///
+    /// Returns a reference to the new current value
+    ///
+    /// # Panics
+    /// This will panic if allocation failed
+    pub fn save(&mut self) -> &mut T
+    where
+        T: Clone,
+    {
+        self.invariant_ck();
+
+        self.invalidate_future();
+
+        // safe to unwrap here because history is always nonempty
+        let val = self.history.last().unwrap().clone();
+
+        self.push_unchecked(val)
+    }
+
+    /// Pushes the given value to the stack, making it the new current value and invalidating
+    /// future history, returns a reference to the new current value
+    ///
+    /// This is functionally identical to [`save`](UndoStack::save) but does not have a `Clone`
+    /// bound, instead sourcing its new value from the caller.
+    ///
+    /// # Panics
+    /// This will panic if allocation failed
+    pub fn push(&mut self, new_current: T) -> &mut T {
+        self.invariant_ck();
+
+        self.invalidate_future();
+
+        self.push_unchecked(new_current)
+    }
+
+    /// If there is a previous state in the history stack, backtrack to that and return `Ok(&mut T)`
+    /// to the new current value, otherwise return `Err(&mut T)` to the unchanged current value.
+    #[allow(clippy::missing_errors_doc)]
     pub fn undo(&mut self) -> Result<&mut T, &mut T> {
+        self.invariant_ck();
+
         match self.current.checked_sub(1) {
             Some(n) => {
                 self.current = n;
@@ -189,11 +269,14 @@ impl<T> UndoStack<T> {
         }
     }
 
-    /// If there is a future state in the history stack that we have undone from, redo to that
-    /// position and return Ok(&mut T) of the new current value after advancing, else return
-    /// Err(&mut T) of the current unchanged value.
+    /// If there is a future state in the history stack that has been undone from, redo to that
+    /// position and return `Ok(&mut T)` of the new current value after advancing, else return
+    /// `Err(&mut T)` of the current unchanged value, if there was no future history.
+    #[allow(clippy::missing_errors_doc)]
     pub fn redo(&mut self) -> Result<&mut T, &mut T> {
-        if self.current + 1 != self.history.len() {
+        self.invariant_ck();
+
+        if self.current + 1 == self.history.len() {
             Err(&mut self.history[self.current])
         } else {
             self.current += 1;
@@ -202,12 +285,19 @@ impl<T> UndoStack<T> {
         }
     }
 
-    pub fn get(&self) -> &T {
-        &self.history[self.current]
+    /// function that runs in debug and checks all trivial invariants of `UndoStack`
+    fn invariant_ck(&self) {
+        debug_assert!(
+            !self.history.is_empty(),
+            "UndoStack: history was empty, this indicates a bug in UndoStack"
+        );
+        debug_assert!(self.current < self.history.len(), "UndoStack: current was not less than history length, this indicates a bug in UndoStack");
     }
 
-    pub fn get_mut(&mut self) -> &mut T {
-        &mut self.history[self.current]
+    /// Gets a reference to the current value
+    /// used to implement traits via T without accidental recursion
+    fn inner(&self) -> &T {
+        self
     }
 }
 
@@ -215,25 +305,25 @@ impl<T> ops::Deref for UndoStack<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        self.get()
+        &self.history[self.current]
     }
 }
 
 impl<T> ops::DerefMut for UndoStack<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.get_mut()
+        &mut self.history[self.current]
     }
 }
 
 impl<T: PartialEq> PartialEq<T> for UndoStack<T> {
     fn eq(&self, other: &T) -> bool {
-        self.get() == other
+        self.inner() == other
     }
 }
 
 impl<T: PartialEq> PartialEq for UndoStack<T> {
     fn eq(&self, other: &Self) -> bool {
-        self.get() == other.get()
+        self.inner() == other.inner()
     }
 }
 
@@ -241,24 +331,56 @@ impl<T: Eq> Eq for UndoStack<T> {}
 
 impl<T: PartialOrd> PartialOrd for UndoStack<T> {
     fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
-        self.get().partial_cmp(other.get())
+        self.inner().partial_cmp(other.inner())
     }
 }
 
 impl<T: PartialOrd> PartialOrd<T> for UndoStack<T> {
     fn partial_cmp(&self, other: &T) -> Option<cmp::Ordering> {
-        self.get().partial_cmp(other)
+        self.inner().partial_cmp(other)
     }
 }
 
 impl<T: Ord> Ord for UndoStack<T> {
     fn cmp(&self, other: &Self) -> cmp::Ordering {
-        self.get().cmp(other.get())
+        self.inner().cmp(other.inner())
     }
 }
 
 impl<T: hash::Hash> hash::Hash for UndoStack<T> {
     fn hash<H: hash::Hasher>(&self, state: &mut H) {
-        self.get().hash(state);
+        self.inner().hash(state);
     }
+}
+
+#[test]
+fn undo_stack() {
+    let mut g = UndoStack::new(0u8);
+
+    *g.save() += 1;
+
+    assert_eq!(g, 1);
+
+    assert_eq!(*g.undo().unwrap(), 0);
+
+    assert_eq!(*g.redo().unwrap(), 1);
+
+    assert!(g.undo().is_ok());
+
+    *g.save() += 2;
+
+    assert!(g.redo().is_err());
+}
+
+#[test]
+fn history_stack() {
+    let mut g = HistoryStack::new(0u8);
+
+    g.push_value(5);
+
+    assert_eq!(g, 5);
+
+    assert_eq!(g.pop(), Some(5));
+
+    assert_eq!(g, 0);
 }
